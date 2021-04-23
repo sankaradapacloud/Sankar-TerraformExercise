@@ -1,0 +1,305 @@
+## Creates VPC and Subnets & networking
+
+## Creates VPC
+resource "aws_vpc" "main" {
+  cidr_block           = "${var.vpc_cidr}"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags {
+    Name         = "${var.env_name}"
+    managed_by   = "terraform"
+    project_name = "${var.project_name}"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+## Creates a variable
+output "vpc_id" {
+  value = "${aws_vpc.main.id}"
+}
+
+## Creates Internet gateway (IGW)
+resource "aws_internet_gateway" "main" {
+  vpc_id = "${aws_vpc.main.id}"
+
+  tags {
+    Name         = "main.${var.env_name}"
+    managed_by   = "terraform"
+    project_name = "${var.project_name}"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+## Creates route table for subnets wishing to route traffic through the IGW
+resource "aws_route_table" "rt_igw" {
+  vpc_id = "${aws_vpc.main.id}"
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = "${aws_internet_gateway.main.id}"
+  }
+
+  tags {
+    Name         = "igw.${var.env_name}"
+    managed_by   = "terraform"
+    project_name = "${var.project_name}"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+## Adds DMZ subnets for public facing instances across As
+resource "aws_subnet" "public" {
+  count             = "${var.public_subnet_count}"
+  vpc_id            = "${aws_vpc.main.id}"
+  cidr_block        = "${lookup(var.subnets_public_cidr, count.index)}"
+  availability_zone = "${element(split(",", replace(lookup(var.azs, var.region), " ", "")), count.index)}"
+
+  tags {
+    Name         = "public_az${count.index}.${var.env_name}"
+    project_name = "${var.project_name}"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+## Routes DMZ traffic through the IGW
+resource "aws_route_table_association" "rta_igw" {
+  count          = "${var.public_subnet_count}"
+  subnet_id      = "${element(aws_subnet.public.*.id, count.index)}"
+  route_table_id = "${aws_route_table.rt_igw.id}"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+## Creates NAT gateways across AZs
+resource "aws_nat_gateway" "nat" {
+  count         = "${var.public_subnet_count}"
+  allocation_id = "${element(aws_eip.eip_nat.*.id,count.index)}"
+  subnet_id     = "${element(aws_subnet.public.*.id, count.index)}"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  depends_on = ["aws_internet_gateway.main"]
+}
+
+resource "aws_eip" "eip_nat" {
+  count = "${var.public_subnet_count}"
+  vpc   = true
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+## Creates route tables for subnets wishing to route traffic through a NAT gateway
+resource "aws_route_table" "rt_nat" {
+  count  = "${var.private_subnet_count}"
+  vpc_id = "${aws_vpc.main.id}"
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = "${element(aws_nat_gateway.nat.*.id, count.index)}"
+  }
+
+  tags {
+    Name         = "nat_az1.${var.env_name}"
+    managed_by   = "terraform"
+    project_name = "${var.project_name}"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_security_group" "alb" {
+  name        = "terraform_alb_security_group"
+  description = "Terraform load balancer security group"
+  vpc_id      = "${aws_vpc.vpc.id}"
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = "${var.allowed_cidr_blocks}"
+  }
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = "${var.allowed_cidr_blocks}"
+  }
+
+  # Allow all outbound traffic.
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags {
+    Name = "terraform-example-alb-security-group"
+  }
+}
+
+
+resource "aws_lb_listener_certificate" "web" {
+  listener_arn    = aws_lb_listener.front_end.arn
+  certificate_arn = aws_acm_certificate.example.arn
+}
+
+resource "aws_alb" "alb" {  
+  name            = "${var.alb_name}"  
+  subnets         = ["${split(",",var.alb_subnets)}"]
+  security_groups = ["${split(",", var.alb_security_groups)}"]
+  internal        = "${var.internal_alb}"  
+  idle_timeout    = "${var.idle_timeout}"   
+  tags {    
+    Name    = "${var.alb_name}"    
+  }   
+  access_logs {    
+    bucket = "${var.s3_bucket}"    
+    prefix = "ELB-logs"  
+  }
+}
+
+resource "aws_alb_listener" "alb_listener" {  
+  load_balancer_arn = "${aws_alb.alb.arn}"  
+  port              = "${var.alb_listener_port}"  
+  protocol          = "${var.alb_listener_protocol}"
+  ssl_policy        = "ELBSecurityPolicy-2016-08"
+  certificate_arn   = "${aws_lb_listener_certificate.web}"
+  
+  default_action {    
+    target_group_arn = "${aws_alb_target_group.alb_target.arn}"
+    type             = "forward"  
+  }
+}
+
+resource "aws_alb_listener_rule" "listener_rule" {
+  depends_on   = ["aws_alb_target_group.alb_target_group"]  
+  listener_arn = "${aws_alb_listener.alb_listener.arn}"  
+  priority     = "${var.priority}"   
+  action {    
+    type             = "forward"    
+    target_group_arn = "${aws_alb_target_group.alb_target_group.id}"  
+  }   
+  condition {    
+    field  = "path-pattern"    
+    values = ["${var.alb_path}"]  
+  }
+}
+
+resource "aws_alb_target_group" "alb_target_group" {  
+  name     = "${var.target_group_name}"  
+  port     = "${var.svc_port}"  
+  protocol = "HTTP"  
+  vpc_id   = "${var.vpc_id}"   
+  tags {    
+    name = "${var.target_group_name}"    
+  }   
+  stickiness {    
+    type            = "lb_cookie"    
+    cookie_duration = 1800    
+    enabled         = "${var.target_group_sticky}"  
+  }   
+  health_check {    
+    healthy_threshold   = 3    
+    unhealthy_threshold = 10    
+    timeout             = 5    
+    interval            = 10    
+    path                = "${var.target_group_path}"    
+    port                = "${var.target_group_port}"  
+  }
+}
+
+#Instance Attachment
+resource "aws_alb_target_group_attachment" "svc_physical_external" {
+  target_group_arn = "${aws_alb_target_group.alb_target_group.arn}"
+  target_id        = "${aws_instance.web.id}"  
+  port             = 8080
+}
+
+resource "aws_s3_bucket" "static bucket" {
+  bucket = "${var.static_bucket_name}"
+  acl    = "private"
+
+}
+
+data "template_file" "user_data" {
+  template = "${file("${path.module}/templates/user_data.sh")}"
+
+  vars = {
+      aws_s3_bucket = "${var.my_bucket_name}"
+  }
+}
+
+## Creates web server
+resource "aws_instance" “web” {
+  ami                         = "${var.web_ami}"
+  instance_type               = "${var.web_instance_type}"
+  subnet_id                   = "${aws_subnet.public.0.id}"
+  associate_public_ip_address = true
+  vpc_security_group_ids      = ["${aws_security_group.web.id}"]
+  user_data            = "${data.template_file.user_data.rendered}"
+  
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  depends_on = ["aws_internet_gateway.main"]
+}
+
+## Adds inernal DNS entry for the web node
+resource "aws_route53_record" "web" {
+  zone_id = "${aws_route53_zone.private.zone_id}"
+  name    = "web"
+  type    = "A"
+  ttl     = "300"
+  records = ["${aws_instance.web.private_ip}"]
+}
+
+## The Security Group for web instance
+resource "aws_security_group" "web" {
+  vpc_id      = "${aws_vpc.main.id}"
+  name        = "web.${var.env_name}"
+  description = "Allow access to web server from limited IPs"
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = "${var.cidr_whitelist}"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+
